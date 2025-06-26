@@ -17,6 +17,7 @@ mod regs;
 mod sbi_console;
 mod trap;
 mod vcpu;
+mod plic;
 
 pub use self::percpu::RISCVPerCpu;
 pub use self::vcpu::RISCVVCpu;

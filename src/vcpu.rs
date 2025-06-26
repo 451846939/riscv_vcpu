@@ -1,19 +1,22 @@
-use core::ops::{Shl, Shr};
-
 use crate::sbi_console::*;
 use axaddrspace::device::AccessWidth;
+use core::ops::{Shl, Shr};
+use core::sync::atomic::{AtomicBool, Ordering};
 use riscv::register::hstatus;
 use riscv::register::{hvip, scause, sie, sstatus};
 use riscv_decode::Instruction;
 use riscv_decode::types::{IType, SType};
-use rustsbi::{Forward, RustSBI};
+use rustsbi::{Forward, RustSBI, Timer};
 use sbi_spec::{hsm, legacy};
 
+use crate::plic::{init_plic, riscv_get_pending_irqs, test_plic_pending};
 use crate::regs::*;
 use crate::{EID_HVC, RISCVVCpuCreateConfig, guest_mem};
 use axaddrspace::{GuestPhysAddr, GuestVirtAddr, HostPhysAddr, MappingFlags};
 use axerrno::AxResult;
-use axvcpu::{AxVCpuExitReason, AxVCpuHal};
+use axvcpu::{AxArchVCpu, AxVCpuExitReason, AxVCpuHal, get_current_vcpu};
+use axvisor_api::arch;
+use axvisor_api::memory::phys_to_virt;
 
 unsafe extern "C" {
     fn _run_guest(state: *mut VmCpuRegisters);
@@ -81,6 +84,7 @@ impl<H: AxVCpuHal> axvcpu::AxArchVCpu for RISCVVCpu<H> {
             hstatus.write();
         }
         self.regs.guest_regs.hstatus = hstatus.bits();
+        init_plic();
         Ok(())
     }
 
@@ -132,21 +136,31 @@ impl<H: AxVCpuHal> axvcpu::AxArchVCpu for RISCVVCpu<H> {
 
     /// Set one of the vCPU's general purpose register.
     fn set_gpr(&mut self, index: usize, val: usize) {
-        match index {
-            0..=7 => {
-                self.set_gpr_from_gpr_index(GprIndex::from_raw(index as u32 + 10).unwrap(), val);
-            }
-            _ => {
-                warn!(
-                    "RISCVVCpu: Unsupported general purpose register index: {}",
-                    index
-                );
-            }
+        // match index {
+        //     0..=7 => {
+        //         self.set_gpr_from_gpr_index(GprIndex::from_raw(index as u32 + 10).unwrap(), val);
+        //     }
+        //     _ => {
+        //         warn!(
+        //             "RISCVVCpu: Unsupported general purpose register index: {}",
+        //             index
+        //         );
+        //     }
+        // }
+        if let Some(idx) = GprIndex::from_raw(index as u32) {
+            self.set_gpr_from_gpr_index(idx, val);
+        } else {
+            warn!("RISCVVCpu: Unsupported general purpose register index: {}", index);
         }
     }
 
     fn inject_interrupt(&mut self, vector: usize) -> AxResult {
-        unimplemented!("RISCVVCpu::inject_interrupt is not implemented yet");
+        info!("Injecting interrupt vector {}", vector);
+        unsafe {
+            riscv::register::hvip::set_vseip();
+        }
+
+        Ok(())
     }
 
     fn set_return_value(&mut self, val: usize) {
@@ -175,6 +189,7 @@ impl<H: AxVCpuHal> RISCVVCpu<H> {
         &mut self.regs
     }
 }
+static FIRST_CALL: AtomicBool = AtomicBool::new(true);
 
 impl<H: AxVCpuHal> RISCVVCpu<H> {
     fn vmexit_handler(&mut self) -> AxResult<AxVCpuExitReason> {
@@ -182,6 +197,7 @@ impl<H: AxVCpuHal> RISCVVCpu<H> {
 
         let scause = scause::read();
         use scause::{Exception, Interrupt, Trap};
+        const EID_TIME: usize = u32::from_be_bytes(*b"TIME") as usize;
 
         trace!(
             "vmexit_handler: {:?}, sepc: {:#x}, stval: {:#x}",
@@ -189,6 +205,10 @@ impl<H: AxVCpuHal> RISCVVCpu<H> {
             self.regs.guest_regs.sepc,
             self.regs.trap_csrs.stval
         );
+        // 只触发一次
+        if FIRST_CALL.swap(false, Ordering::SeqCst) {
+            test_plic_pending(64);
+        }
 
         match scause.cause() {
             Trap::Exception(Exception::VirtualSupervisorEnvCall) => {
@@ -205,6 +225,19 @@ impl<H: AxVCpuHal> RISCVVCpu<H> {
                     param
                 );
                 match extension_id {
+                    EID_TIME => match function_id {
+                        0 => {
+                            // info!("set timer (TIME ext): {}", param[0]);
+                            sbi_rt::set_timer(param[0] as u64);
+                            self.sbi_return(RET_SUCCESS, 0);
+                            return Ok(AxVCpuExitReason::Nothing);
+                        }
+                        _ => {
+                            self.sbi_return(RET_ERR_NOT_SUPPORTED, 0);
+                            return Ok(AxVCpuExitReason::Nothing);
+                        }
+                    },
+
                     // Compatibility with Legacy Extensions.
                     legacy::LEGACY_SET_TIMER..=legacy::LEGACY_SHUTDOWN => match extension_id {
                         legacy::LEGACY_SET_TIMER => {
@@ -292,14 +325,12 @@ impl<H: AxVCpuHal> RISCVVCpu<H> {
                                 &mut *buf,
                                 GuestPhysAddr::from(gpa as usize),
                             );
-
                             if copied == buf.len() {
                                 let ret = console_write(&buf);
                                 self.sbi_return(ret.error, ret.value);
                             } else {
                                 self.sbi_return(RET_ERR_FAILED, 0);
                             }
-
                             return Ok(AxVCpuExitReason::Nothing);
                         }
                         // Read to memory region from debug console.
@@ -363,10 +394,12 @@ impl<H: AxVCpuHal> RISCVVCpu<H> {
                 Ok(AxVCpuExitReason::Nothing)
             }
             Trap::Interrupt(Interrupt::SupervisorTimer) => {
+                // info!("Supervisor timer interrupt");
                 // Enable guest timer interrupt
                 unsafe {
                     hvip::set_vstip();
                     sie::set_stimer();
+                    hvip::clear_vstip();
                 }
 
                 Ok(AxVCpuExitReason::Nothing)
@@ -377,6 +410,14 @@ impl<H: AxVCpuHal> RISCVVCpu<H> {
                 // It's a great fault in the `riscv` crate that `Interrupt` and `Exception` are not
                 // explicitly numbered, and they provide no way to convert them to a number. Also,
                 // `as usize` will give use a wrong value.
+                info!("Supervisor external interrupt");
+                let irq = riscv_get_pending_irqs();
+                if let Some(irq_num) = irq {
+                    arch::inject_virtual_interrupt(irq_num);
+                } else {
+                    return Ok(AxVCpuExitReason::Nothing);
+                }
+
                 Ok(AxVCpuExitReason::ExternalInterrupt { vector: 9 })
             }
             Trap::Exception(

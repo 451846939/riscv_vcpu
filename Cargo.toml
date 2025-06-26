@@ -25,3 +25,9 @@ memory_addr = "0.3.1"
 axaddrspace = { git = "https://github.com/arceos-hypervisor/axaddrspace.git" }
 axvcpu = { git = "https://github.com/arceos-hypervisor/axvcpu.git" }
 axvisor_api = { git = "https://github.com/arceos-hypervisor/axvisor_api.git"}
+#axvisor_api = { path = "../axvisor_api" }
+#riscv_vplic ={path = "../riscv_vplic" }
+riscv_vplic ={git = "https://github.com/451846939/vplic.git" }
+
+riscv_plic = { version = "0.1.0" }
+lazyinit = "0.2.2"
